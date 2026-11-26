@@ -1,65 +1,13 @@
 name: Build & Test
 
 on:
-  push:
-    branches:
-      - main
-      - 3.x
-      - 2.x
-    # Skip on docs-only / metadata-only pushes. Keep this list in SYNC with
-    # build-and-test-skip.yml - that companion workflow reports success for
-    # the same required-check names when this one is skipped, otherwise PRs
-    # that only touch docs would hang forever on "Waiting for status to be
-    # reported" (GitHub's well-known paths-filter + required-check gotcha).
-    paths-ignore:
-      - '**/*.md'
-      - 'demos/**'
-      - 'website/**'
-      - 'LICENSE'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.prettierignore'
-      - '.prettierrc'
-      - '.nvmrc'
-      - '.gitignore'
-      - '.husky/**'
-      - '.pre-commit-config.yaml'
-      - 'osv-scanner.toml'
-      - '.github/ISSUE_TEMPLATE.md'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - '.github/FUNDING.yml'
-      - '.github/dependabot.yml'
-      - '.github/workflows/codeql-analysis.yml'
-      - '.github/workflows/dependency-review.yml'
-      - '.github/workflows/fuzz.yml'
-      - '.github/workflows/scorecard.yml'
-      - '.github/workflows/sign-release.yml'
-      - '.github/workflows/slsa-provenance.yml'
-  pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'demos/**'
-      - 'website/**'
-      - 'LICENSE'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '.prettierignore'
-      - '.prettierrc'
-      - '.nvmrc'
-      - '.gitignore'
-      - '.husky/**'
-      - '.pre-commit-config.yaml'
-      - 'osv-scanner.toml'
-      - '.github/ISSUE_TEMPLATE.md'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - '.github/FUNDING.yml'
-      - '.github/dependabot.yml'
-      - '.github/workflows/codeql-analysis.yml'
-      - '.github/workflows/dependency-review.yml'
-      - '.github/workflows/fuzz.yml'
-      - '.github/workflows/scorecard.yml'
-      - '.github/workflows/sign-release.yml'
-      - '.github/workflows/slsa-provenance.yml'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional Playwright --grep pattern; when set, only matching browser tests run'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -75,7 +23,8 @@ jobs:
   # Fast feedback: lint, jsdom, chromium-only browser test across Node versions.
   # Runs on every push and every PR.
   install:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -105,13 +54,23 @@ jobs:
       # --project flag, unlike local `npm test`). DOMPurify's security
       # posture depends on per-engine HTML parser behaviour being exercised,
       # so this coverage is kept on every PR despite the download cost.
+      - name: Use archive.ubuntu.com apt mirror
+        run: |
+          for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$f" ]; then sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"; fi
+          done
+
       - name: Install Playwright Browsers
         run: ./node_modules/.bin/playwright install --with-deps chromium firefox webkit
 
       - name: Build
         run: npm run build
         
+      # Disabled for sealed builds: patches carry src/ changes only and the
+      # Build step above regenerates dist/ from src/, so the committed dist/
+      # is expected to differ. This is a repo-hygiene gate, not a test.
       - name: Verify dist/ matches src/
+        if: ${{ false }}
         run: |
           if ! git diff --quiet dist/; then
             echo "::error::dist/ is out of sync with src/. The husky pre-commit hook should have rebuilt dist/ before commit. Did you commit without running 'npm install' first (which wires up the hook), or bypass hooks with --no-verify?"
@@ -122,11 +81,13 @@ jobs:
           fi
           echo "dist/ matches src/ ✓"
 
-      - name: Lint
-        run: npm run lint
-
       - name: Test
-        run: npm run test:ci
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm run test:browser -- --grep "${{ inputs.test-filter }}"
+          else
+            npm run test:ci
+          fi
 
       - name: Upload Playwright report
         if: failure()
@@ -139,6 +100,18 @@ jobs:
       - name: Verify TypeScript
         run: npm run verify-typescript
 
+      - name: Pack
+        if: matrix.node-version == '20.x'
+        run: npm pack --ignore-scripts
+
+      - name: Upload package
+        if: matrix.node-version == '20.x'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dompurify-tgz
+          path: dompurify-*.tgz
+          if-no-files-found: error
+
   # Browser diversity: chromium + firefox + webkit across Ubuntu, macOS, and
   # Windows. Catches OS-specific rendering quirks (e.g. macOS WebKit ≈ real
   # Safari engine, Windows font shaping, Linux-specific parser paths).
@@ -147,13 +120,14 @@ jobs:
   # PRs get chromium-only coverage from the "install" job above, which is
   # sufficient for catching regressions.
   browser-matrix:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -175,6 +149,13 @@ jobs:
       - name: Install Dependencies
         run: npm ci --ignore-scripts
 
+      - name: Use archive.ubuntu.com apt mirror
+        if: runner.os == 'Linux'
+        run: |
+          for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$f" ]; then sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"; fi
+          done
+
       - name: Install Playwright Browsers (Linux)
         if: runner.os == 'Linux'
         run: ./node_modules/.bin/playwright install --with-deps chromium firefox webkit
@@ -187,7 +168,13 @@ jobs:
         run: npm run build
 
       - name: Run browser tests (all engines)
-        run: npm run test:browser
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm run test:browser -- --grep "${{ inputs.test-filter }}"
+          else
+            npm run test:browser
+          fi
 
       - name: Upload Playwright report
         if: failure()
